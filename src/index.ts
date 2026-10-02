@@ -60,7 +60,7 @@ export function truthy(v: Tri): boolean {
 // Errors (carry expression-path diagnostics)
 // ---------------------------------------------------------------------------
 
-export type ErrorCode = 'EPARSE' | 'ETYPE' | 'ENAN';
+export type ErrorCode = 'EPARSE' | 'ETYPE' | 'ENAN' | 'EPARAM';
 
 export class JsonPathError extends Error {
     readonly code: ErrorCode;
@@ -107,7 +107,15 @@ export interface IndexStep {
 export interface WildcardStep {
     kind: 'wildcard';
 }
-export type PathStep = FieldStep | IndexStep | WildcardStep;
+/**
+ * A parameterized step `[:name]`. It binds to a concrete field or index
+ * only at execution time; it never appears in a parsed (uncompiled) walk.
+ */
+export interface ParamStep {
+    kind: 'param';
+    name: string;
+}
+export type PathStep = FieldStep | IndexStep | WildcardStep | ParamStep;
 
 interface NodeRange {
     s: number;
@@ -116,6 +124,7 @@ interface NodeRange {
 export type Expr =
     | ({ t: 'path'; root: 'current' | 'root'; steps: PathStep[] } & NodeRange)
     | ({ t: 'lit'; tri: Tri } & NodeRange)
+    | ({ t: 'param'; name: string } & NodeRange)
     | ({ t: 'not'; sub: Expr } & NodeRange)
     | ({ t: 'cmp'; op: CmpOp; l: Expr; r: Expr } & NodeRange)
     | ({ t: 'log'; op: '&&' | '||'; l: Expr; r: Expr } & NodeRange)
@@ -128,6 +137,7 @@ export type Token =
     | { kind: 'field'; value: string }
     | { kind: 'index'; value: number }
     | { kind: 'wildcard' }
+    | { kind: 'param'; name: string }
     | { kind: 'filter'; expr: string; ast: Expr };
 
 // ---------------------------------------------------------------------------
@@ -137,6 +147,14 @@ export type Token =
 const IDENT_START = /[A-Za-z_$]/;
 const IDENT_PART = /[A-Za-z0-9_$-]/;
 const DIGIT = /[0-9]/;
+
+function readParamName(src: string, at: number): string {
+    // ':' followed by an identifier (same character set as field names).
+    let j = at + 1;
+    if (!IDENT_START.test(src[j] ?? '')) return '';
+    while (j < src.length && IDENT_PART.test(src[j])) j++;
+    return src.slice(at + 1, j);
+}
 
 function unescapeString(raw: string): string {
     const body = raw.slice(1, -1);
@@ -227,7 +245,11 @@ function parseFilter(src: string): Expr {
                 const inner = src.slice(i + 1, j - 1).trim();
                 if (inner === '*') steps.push({ kind: 'wildcard' });
                 else if (/^-?\d+$/.test(inner)) steps.push({ kind: 'index', value: Number(inner) });
-                else if (
+                else if (inner.startsWith(':')) {
+                    const name = readParamName(inner, 0);
+                    if (name && name.length === inner.length - 1) steps.push({ kind: 'param', name });
+                    else fail(`unsupported bracket segment [${inner}]`, i);
+                } else if (
                     (inner.startsWith("'") || inner.startsWith('"')) &&
                     inner.endsWith(inner[0]) &&
                     inner.length >= 2
@@ -263,6 +285,12 @@ function parseFilter(src: string): Expr {
             return { t: 'lit', tri: concrete(r.value), s: start, e: p };
         }
         if (c === '-' || DIGIT.test(c ?? '')) return readNumber(p);
+        if (c === ':') {
+            const name = readParamName(src, p);
+            if (!name) fail('invalid parameter name', p);
+            p += name.length + 1;
+            return { t: 'param', name, s: start, e: p };
+        }
         if (c === '(') {
             p++;
             const inner = parseOr();
@@ -414,6 +442,15 @@ export function parse(path: string): Token[] {
                 out.push({ kind: 'field', value: unescapeString(inner) });
             } else if (/^-?\d+$/.test(inner.trim())) {
                 out.push({ kind: 'index', value: Number(inner.trim()) });
+            } else if (inner.trim().startsWith(':')) {
+                const seg = inner.trim();
+                const name = readParamName(seg, 0);
+                if (name && name.length === seg.length - 1) out.push({ kind: 'param', name });
+                else
+                    throw new JsonPathError('EPARSE', `unsupported bracket segment [${inner}]`, {
+                        expression: path,
+                        offending: inner,
+                    });
             } else if (IDENT_START.test(inner[0] ?? '')) {
                 out.push({ kind: 'field', value: inner });
             } else {
@@ -440,7 +477,18 @@ export function parse(path: string): Token[] {
 export interface FilterContext {
     root: unknown;
     current?: unknown;
+    /** Parameter values for `:name` placeholders, scoped to this one call. */
+    params?: Params;
 }
+
+/**
+ * Execution-scoped parameter values. Keyed by the `:name` used in a saved
+ * query. A key that is absent (or explicitly `undefined`) is a MISSING
+ * parameter and produces a located EPARAM error wherever the placeholder is
+ * reached — it never silently behaves like an empty match. `null` is a
+ * provided value (the NULL state), distinct from a missing parameter.
+ */
+export type Params = Record<string, unknown>;
 
 interface ResolvedNode {
     tri: Tri;
@@ -453,6 +501,7 @@ interface EvalState {
     current: Tri;
     /** Path of the @ node inside the enclosing selection (empty for standalone). */
     baseLoc: (string | number)[];
+    params: Params;
 }
 
 function evalState(ctx: {
@@ -460,13 +509,82 @@ function evalState(ctx: {
     root: Tri;
     current: Tri;
     baseLoc: (string | number)[];
+    params?: Params;
 }): EvalState {
     return {
         source: ctx.source,
         root: ctx.root,
         current: ctx.current,
         baseLoc: ctx.baseLoc,
+        params: ctx.params ?? {},
     };
+}
+
+/**
+ * Resolve a `:name` parameter to its three-state value for THIS execution.
+ * Returns undefined only when the parameter was not supplied; callers turn
+ * that into a located EPARAM error. Parameter values are boxed, never parsed:
+ * a string containing quotes or JSONPath punctuation is still just a string.
+ */
+function lookupParam(name: string, st: EvalState): Tri | undefined {
+    // An explicit `undefined` is the same as not supplying the parameter:
+    // the placeholder itself is unbound and must fail with EPARAM. Only an
+    // actual `null` reaches box() and becomes the NULL state.
+    if (!Object.prototype.hasOwnProperty.call(st.params, name)) return undefined;
+    const v = st.params[name];
+    if (v === undefined) return undefined;
+    return box(v);
+}
+
+function missingParamError(
+    name: string,
+    st: EvalState,
+    loc: (string | number)[],
+    node?: NodeRange,
+): JsonPathError {
+    return new JsonPathError('EPARAM', `missing parameter '${name}'`, {
+        expression: st.source,
+        offending: node && st.source ? st.source.slice(node.s, node.e) : `:${name}`,
+        path: diagPath(st, loc),
+    });
+}
+
+/**
+ * Resolve a `[:name]` segment against its value. A string is a field name,
+ * an integer an array index; anything else (boolean, float, object, array,
+ * null) is an EPARAM type error at the document location of the step.
+ */
+function paramStep(
+    name: string,
+    st: EvalState,
+    loc: (string | number)[],
+    exprNode?: NodeRange,
+): PathStep {
+    const tri = lookupParam(name, st);
+    if (!tri) throw missingParamError(name, st, loc, exprNode);
+    if (tri.state === 'null' || tri.state === 'missing') {
+        throw new JsonPathError(
+            'EPARAM',
+            `parameter '${name}' cannot be used as a field or index (got ${describeTri(tri)})`,
+            {
+                expression: st.source,
+                offending: exprNode && st.source ? st.source.slice(exprNode.s, exprNode.e) : `:${name}`,
+                path: diagPath(st, loc),
+            },
+        );
+    }
+    const v = tri.value;
+    if (typeof v === 'string') return { kind: 'field', value: v };
+    if (typeof v === 'number' && Number.isInteger(v)) return { kind: 'index', value: v };
+    throw new JsonPathError(
+        'EPARAM',
+        `parameter '${name}' cannot be used as a field or index (got ${describeTri(tri)})`,
+        {
+            expression: st.source,
+            offending: exprNode && st.source ? st.source.slice(exprNode.s, exprNode.e) : `:${name}`,
+            path: diagPath(st, loc),
+        },
+    );
 }
 
 function isArrayLikeObject(v: unknown): v is unknown[] {
@@ -489,6 +607,13 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
  *   object + numeric index         -> reads the matching string key
  */
 function applyStep(node: ResolvedNode, step: PathStep, st: EvalState, exprNode?: NodeRange): ResolvedNode[] {
+    // Parameter segments resolve from THIS execution's params before any
+    // navigation, so a missing/ill-typed parameter is a located error even
+    // when the container node is itself missing — never a silent empty set.
+    if (step.kind === 'param') {
+        const resolved = paramStep(step.name, st, node.loc, exprNode);
+        return applyStep(node, resolved, st, exprNode);
+    }
     const tri = node.tri;
     if (tri.state === 'missing') {
         if (step.kind === 'wildcard') return [];
@@ -705,6 +830,14 @@ function evalTri(e: Expr, st: EvalState): Tri {
     switch (e.t) {
         case 'lit':
             return e.tri;
+        case 'param': {
+            // A placeholder value belongs to THIS execution only. It is
+            // evaluated as a literal value (boxing preserves null vs missing);
+            // it is never re-interpreted as path syntax.
+            const tri = lookupParam(e.name, st);
+            if (!tri) throw missingParamError(e.name, st, [], e);
+            return tri;
+        }
         case 'path': {
             const nodes = evalPath(e, st);
             return nodes.length ? nodes[0].tri : MISSING;
@@ -733,6 +866,15 @@ function testExpr(e: Expr, st: EvalState): boolean {
             return evalPath(e, st).some((n) => exists(n.tri));
         case 'lit':
             return truthy(e.tri);
+        case 'param': {
+            // A bare parameter follows the same truthiness conversion as a
+            // literal: false / 0 / "" / null are falsy but still PROVIDED,
+            // while an unbound parameter is an EPARAM error. Use an explicit
+            // comparison (`:flag == true`, `:x == null`) for value matching.
+            const tri = lookupParam(e.name, st);
+            if (!tri) throw missingParamError(e.name, st, [], e);
+            return truthy(tri);
+        }
         case 'paren':
             return testExpr(e.sub, st);
         case 'not':
@@ -764,6 +906,7 @@ export function evalFilter(expression: string, ctx: FilterContext): TriResult {
         root: box(ctx.root),
         current: box(ctx.current),
         baseLoc: [],
+        params: ctx.params,
     });
     const tri = evalTri(ast, st);
     return { ...tri, expression };
@@ -777,8 +920,77 @@ export function testFilter(expression: string, ctx: FilterContext): boolean {
         root: box(ctx.root),
         current: box(ctx.current),
         baseLoc: [],
+        params: ctx.params,
     });
     return testExpr(ast, st);
+}
+
+// ---------------------------------------------------------------------------
+// Compiled (saved) queries
+// ---------------------------------------------------------------------------
+
+/**
+ * Anything the query functions accept: a raw JSONPath string (parsed on every
+ * call, as before), an already-parsed Token[] (also as before), or a reusable
+ * compiled / parameter-bound query.
+ */
+export type PathInput = string | Token[] | CompiledQuery | BoundQuery;
+
+/**
+ * A query saved independently of any concrete parameter values or document.
+ * The parsed structure is immutable and shared across requests; every
+ * execution receives its own parameter map and evaluator state, so concurrent
+ * uses on different roots with different parameters never interfere.
+ */
+export interface CompiledQuery {
+    readonly kind: 'compiled';
+    /** Original JSONPath text; diagnostics for every execution point here. */
+    readonly source: string;
+    /** Parsed tokens; never mutated by evaluation. */
+    readonly tokens: Token[];
+    /**
+     * Return a query with these parameters bound. Bound params are copied;
+     * the compiled query keeps no mutable per-execution state. Parameters
+     * given to the executing call take precedence over bound ones.
+     */
+    bind(params?: Params): BoundQuery;
+}
+
+/** A compiled query with a (copied) parameter map attached. */
+export interface BoundQuery {
+    readonly kind: 'bound';
+    readonly compiled: CompiledQuery;
+    readonly params: Params;
+    /** Bind additional parameters (merged over the ones already bound). */
+    bind(params?: Params): BoundQuery;
+}
+
+/**
+ * Parse once into a reusable form. The structure is fixed by the text;
+ * `:name` placeholders are part of that structure and are only ever filled
+ * with VALUES at execution time — their values are never parsed as
+ * JSONPath, so quotes or path punctuation in a parameter cannot change the
+ * shape of the query.
+ */
+export function compile(path: string): CompiledQuery {
+    const tokens = parse(path);
+    const make = (params: Params): BoundQuery => ({
+        kind: 'bound',
+        compiled: compiled,
+        params,
+        bind(extra?: Params) {
+            return make({ ...params, ...(extra ?? {}) });
+        },
+    });
+    const compiled: CompiledQuery = {
+        kind: 'compiled',
+        source: path,
+        tokens,
+        bind(params?: Params) {
+            return make({ ...(params ?? {}) });
+        },
+    };
+    return compiled;
 }
 
 // ---------------------------------------------------------------------------
@@ -801,11 +1013,41 @@ function toPathStep(tok: Token): PathStep | undefined {
     if (tok.kind === 'field') return { kind: 'field', value: tok.value };
     if (tok.kind === 'index') return { kind: 'index', value: tok.value };
     if (tok.kind === 'wildcard') return { kind: 'wildcard' };
+    if (tok.kind === 'param') return { kind: 'param', name: tok.name };
     return undefined;
 }
 
-export function select(root: unknown, path: string | Token[]): Match[] {
-    const tokens = typeof path === 'string' ? parse(path) : path;
+/**
+ * Resolve any accepted path form to tokens + THIS execution's parameter map
+ * and diagnostic source. A fresh params object is created on every call and
+ * never shared between executions; execution arguments win over bound ones.
+ */
+function resolvePath(
+    path: PathInput,
+    params?: Params,
+): { tokens: Token[]; params: Params; source: string | undefined } {
+    if (typeof path === 'string') {
+        return { tokens: parse(path), params: { ...(params ?? {}) }, source: path };
+    }
+    if (Array.isArray(path)) {
+        return { tokens: path, params: { ...(params ?? {}) }, source: undefined };
+    }
+    if (path.kind === 'bound') {
+        return {
+            tokens: path.compiled.tokens,
+            params: { ...path.params, ...(params ?? {}) },
+            source: path.compiled.source,
+        };
+    }
+    return {
+        tokens: path.tokens,
+        params: { ...(params ?? {}) },
+        source: path.source,
+    };
+}
+
+export function select(root: unknown, path: PathInput, params?: Params): Match[] {
+    const { tokens, params: p, source } = resolvePath(path, params);
     let nodes: WalkNode[] = [{ tri: box(root), loc: [] }];
 
     for (const tok of tokens.slice(1)) {
@@ -835,6 +1077,7 @@ export function select(root: unknown, path: string | Token[]): Match[] {
                             root: box(root),
                             current: c.tri,
                             baseLoc: c.loc,
+                            params: p,
                         }),
                     ),
                 );
@@ -846,7 +1089,13 @@ export function select(root: unknown, path: string | Token[]): Match[] {
                     applyStep(
                         n,
                         step,
-                        evalState({ root: box(root), current: MISSING, baseLoc: [] }),
+                        evalState({
+                            source,
+                            root: box(root),
+                            current: MISSING,
+                            baseLoc: [],
+                            params: p,
+                        }),
                     ),
                 );
             }
@@ -866,8 +1115,8 @@ export function select(root: unknown, path: string | Token[]): Match[] {
 }
 
 /** Return the concrete values selected by `path` (missing results dropped). */
-export function query(root: unknown, path: string | Token[]): unknown[] {
-    return select(root, path)
+export function query(root: unknown, path: PathInput, params?: Params): unknown[] {
+    return select(root, path, params)
         .filter((m) => m.present)
         .map((m) => m.value);
 }
@@ -897,12 +1146,16 @@ export interface UpdateResult {
  */
 export function update(
     root: unknown,
-    path: string | Token[],
+    path: PathInput,
     replacer: (value: unknown, path: (string | number)[]) => unknown,
+    params?: Params,
 ): UpdateResult {
     // select() is the exact same evaluator used by query(), so query and
-    // update always agree on which nodes match.
-    const matches = select(root, path).filter((m) => m.present);
+    // update always agree on which nodes match, including which `:name`
+    // placeholders bind to which values for THIS execution. All execution
+    // state (params, evaluator) is local to this call; a throwing replacer
+    // leaves nothing behind that could change a later execution.
+    const matches = select(root, path, params).filter((m) => m.present);
     const changes: Change[] = [];
     let nextRoot = root;
 
